@@ -1,0 +1,2 @@
+VERSION = "0.1.0"
+ADAPTER_VERSION = f"krea2-nag/{VERSION}"
