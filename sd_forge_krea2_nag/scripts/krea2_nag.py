@@ -30,12 +30,14 @@ class Krea2NagScript(scripts.Script):
         return "Krea2 NAG"
 
     def show(self, is_img2img):
-        return not is_img2img
+        if is_img2img:
+            return False
+        return getattr(scripts, "AlwaysVisible", True)
 
     def ui(self, is_img2img):
         if gr is None:
             return []
-        with gr.Accordion("Krea2 Normalized Attention Guidance", open=False):
+        with gr.Accordion("Krea2 Normalized Attention Guidance", open=True, elem_id="krea2_nag_txt2img_options"):
             enabled = gr.Checkbox(label="Enable Krea2 NAG", value=False)
             negative = gr.Textbox(label="NAG negative prompt", lines=3, placeholder="text, watermark, blurry, low quality, deformed hands", value="")
             nag_scale = gr.Slider(label="nag_scale", minimum=1.0, maximum=15.0, step=0.1, value=5.0)
@@ -43,7 +45,7 @@ class Krea2NagScript(scripts.Script):
             nag_alpha = gr.Slider(label="nag_alpha", minimum=0.0, maximum=1.0, step=0.01, value=0.125)
             timestep_end = gr.Slider(label="Apply NAG until t <=", minimum=0.0, maximum=1.0, step=0.01, value=1.0)
             mode = gr.Dropdown(label="Compatibility mode", choices=["auto", "krea2_turbo", "krea2_raw", "force_disable"], value="auto")
-            debug_logging = gr.Checkbox(label="Debug logging", value=True)
+            debug_logging = gr.Checkbox(label="Debug logging", value=False)
         return [enabled, negative, nag_scale, nag_tau, nag_alpha, timestep_end, mode, debug_logging]
 
     def process_before_every_sampling(self, p, enabled, negative, nag_scale, nag_tau, nag_alpha, timestep_end, mode, debug_logging, *args):

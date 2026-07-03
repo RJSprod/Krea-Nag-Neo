@@ -7,7 +7,7 @@ and Krea2 LoRA workflows.
 ## Install
 
 Copy `sd_forge_krea2_nag` into your Forge Neo `extensions/` directory and restart Forge Neo.
-The **Krea2 Normalized Attention Guidance** section appears in txt2img.
+The **Krea2 Normalized Attention Guidance** section appears directly on the txt2img tab as an expanded options panel; it does not need to be selected from the Scripts dropdown.
 
 ## Controls
 
@@ -18,7 +18,7 @@ The **Krea2 Normalized Attention Guidance** section appears in txt2img.
 - **nag_alpha**: blend from original positive attention features to normalized guided features.
 - **Apply NAG until t <=**: reserved timestep cutoff control for Forge sampler integration.
 - **Compatibility mode**: `auto`, `krea2_turbo`, `krea2_raw`, or `force_disable`.
-- **Debug logging**: prints model detection, patching, dtype, and attention tensor diagnostics.
+- **Debug logging**: prints model detection, patching, dtype, and attention tensor diagnostics. Disabled by default.
 
 ## Warnings
 
