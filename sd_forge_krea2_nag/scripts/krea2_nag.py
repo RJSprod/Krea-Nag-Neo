@@ -48,7 +48,20 @@ class Krea2NagScript(scripts.Script):
             debug_logging = gr.Checkbox(label="Debug logging", value=False)
         return [enabled, negative, nag_scale, nag_tau, nag_alpha, timestep_end, mode, debug_logging]
 
-    def process_before_every_sampling(self, p, enabled, negative, nag_scale, nag_tau, nag_alpha, timestep_end, mode, debug_logging, *args):
+    def process_before_every_sampling(
+        self,
+        p,
+        enabled=False,
+        negative="",
+        nag_scale=5.0,
+        nag_tau=2.5,
+        nag_alpha=0.125,
+        timestep_end=1.0,
+        mode="auto",
+        debug_logging=False,
+        *args,
+        **kwargs,
+    ):
         restore_krea2_attention_patches(getattr(p, "sd_model", None))
         if not enabled:
             return
