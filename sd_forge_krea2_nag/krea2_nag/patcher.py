@@ -16,6 +16,12 @@ REQUIRED_ATTR_SETS = (
     ("qkv", "o"),
     ("qkv", "proj"),
     ("qkv", "out_proj"),
+    ("qkv", "proj_out"),
+    ("qkv", "out"),
+    ("to_qkv", "proj_out"),
+    ("to_qkv", "out_proj"),
+    ("to_qkv", "proj"),
+    ("to_qkv", "out"),
     ("q_proj", "k_proj", "v_proj"),
     ("to_q", "to_k", "to_v"),
     ("wq", "wk", "wv"),
@@ -39,8 +45,10 @@ CONTAINER_ATTRS = (
     "base_model",
     "denoiser",
     "network",
+    "patcher",
+    "model_patcher",
 )
-BLOCK_ATTRS = ("blocks", "transformer_blocks", "double_blocks", "single_blocks", "joint_blocks", "layers")
+BLOCK_ATTRS = ("blocks", "transformer_blocks", "double_blocks", "single_blocks", "joint_blocks", "layers", "modules")
 MAX_FALLBACK_DEPTH = 12
 
 
@@ -99,13 +107,28 @@ def _iter_fallback_modules(root: Any) -> Iterable[tuple[str, Any]]:
                 child = None
             if child is not None:
                 children.append((f"{path}.{attr}" if path else attr, child))
+        module_dict = getattr(obj, "_modules", None)
+        if isinstance(module_dict, dict):
+            children.extend((f"{path}._modules.{key}" if path else f"_modules.{key}", value) for key, value in module_dict.items())
+
         if isinstance(obj, dict):
             children.extend((f"{path}.{key}" if path else str(key), value) for key, value in obj.items())
-        elif isinstance(obj, (list, tuple)):
-            children.extend((f"{path}.{idx}" if path else str(idx), value) for idx, value in enumerate(obj))
+        elif isinstance(obj, (list, tuple)) or obj.__class__.__name__ in ("ModuleList", "Sequential"):
+            try:
+                iterator = enumerate(obj)
+            except TypeError:
+                iterator = ()
+            children.extend((f"{path}.{idx}" if path else str(idx), value) for idx, value in iterator)
+        elif hasattr(obj, "items") and callable(getattr(obj, "items", None)):
+            try:
+                children.extend((f"{path}.{key}" if path else str(key), value) for key, value in obj.items())
+            except Exception:
+                pass
         else:
             for key, value in getattr(obj, "__dict__", {}).items():
-                if key.startswith("_") or callable(value):
+                if key.startswith("_") and key != "_modules":
+                    continue
+                if callable(value):
                     continue
                 children.append((f"{path}.{key}" if path else key, value))
 
@@ -129,7 +152,7 @@ def iter_attention_modules(model: Any, state: Any | None = None):
                 debug(getattr(state, "debug", False), f"compatible attention candidate via {source_name}: {name or '<root>'} ({module.__class__.__name__})")
                 yield name or "<root>", module
             elif getattr(state, "debug", False) and callable(getattr(module, "forward", None)) and (_has_attention_projections(module) or _forward_mentions_attention(module) or "att" in module.__class__.__name__.lower()):
-                attrs = ",".join(a for a in ("qkv", "wo", "q_proj", "k_proj", "v_proj", "to_q", "to_k", "to_v", "wq", "wk", "wv", "out_proj") if hasattr(module, a))
+                attrs = ",".join(a for a in ("qkv", "to_qkv", "wo", "proj_out", "out", "q_proj", "k_proj", "v_proj", "to_q", "to_k", "to_v", "wq", "wk", "wv", "out_proj") if hasattr(module, a))
                 candidates.append(f"{name or '<root>'} ({module.__class__.__name__}; attrs={attrs or '-'})")
     if candidates:
         debug(True, "unpatched attention-like candidates: " + "; ".join(candidates[:20]))
