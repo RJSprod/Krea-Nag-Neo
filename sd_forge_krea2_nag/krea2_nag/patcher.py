@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import inspect
 from typing import Any
 
 from .attention import wrap_forward
@@ -9,17 +10,26 @@ from .logging import debug, warn
 _ORIGINALS: dict[int, tuple[Any, Any]] = {}
 
 ATTN_NAME_MARKERS = ("attn", "attention")
-ATTN_CLASS_MARKERS = ("attention", "selfattention", "jointattention")
+ATTN_CLASS_MARKERS = ("attention", "selfattention", "jointattention", "multiheadattention")
 REQUIRED_ATTR_SETS = (
     ("qkv", "wo"),  # official Krea2/mmdit style
     ("qkv", "o"),
     ("qkv", "proj"),
+    ("qkv", "out_proj"),
+    ("q_proj", "k_proj", "v_proj"),
     ("to_q", "to_k", "to_v"),
+    ("wq", "wk", "wv"),
     ("q", "k", "v"),
+)
+ATTENTION_SOURCE_MARKERS = (
+    "scaled_dot_product_attention",
+    "attention(",
+    "attn",
 )
 CONTAINER_ATTRS = (
     "model",
     "diffusion_model",
+    "diffusion_engine",
     "inner_model",
     "inner",
     "forge_objects",
@@ -27,13 +37,23 @@ CONTAINER_ATTRS = (
     "transformer",
     "model_base",
     "base_model",
+    "denoiser",
+    "network",
 )
-BLOCK_ATTRS = ("blocks", "transformer_blocks", "double_blocks", "single_blocks", "joint_blocks")
-MAX_FALLBACK_DEPTH = 8
+BLOCK_ATTRS = ("blocks", "transformer_blocks", "double_blocks", "single_blocks", "joint_blocks", "layers")
+MAX_FALLBACK_DEPTH = 12
 
 
 def _has_attention_projections(module: Any) -> bool:
     return any(all(hasattr(module, attr) for attr in attrs) for attrs in REQUIRED_ATTR_SETS)
+
+
+def _forward_mentions_attention(module: Any) -> bool:
+    try:
+        source = inspect.getsource(module.forward).lower()
+    except (OSError, TypeError):
+        return False
+    return any(marker in source for marker in ATTENTION_SOURCE_MARKERS)
 
 
 def _looks_like_attention(name: str, module: Any) -> bool:
@@ -43,10 +63,14 @@ def _looks_like_attention(name: str, module: Any) -> bool:
     cls_name = module.__class__.__name__.lower()
     has_name_hint = any(marker in lname for marker in ATTN_NAME_MARKERS) or any(marker in cls_name for marker in ATTN_CLASS_MARKERS)
     has_projection_hint = _has_attention_projections(module)
+    has_source_hint = _forward_mentions_attention(module)
     # Forge Neo/Krea2 wrappers sometimes expose official qkv/wo attention modules
-    # under block-local names that do not contain "attn".  Projection structure is
-    # the stronger compatibility signal, so accept it even without a name hint.
-    return has_projection_hint or (has_name_hint and "attention" in cls_name)
+    # under block-local names that do not contain "attn". Projection structure is
+    # the strongest compatibility signal, so accept it even without a name hint.
+    # Some Forge builds also wrap attention in classes whose projections are nested
+    # or renamed; for those, accept attention-named forward callables and forward
+    # implementations that visibly call an attention kernel.
+    return has_projection_hint or has_name_hint or has_source_hint
 
 
 def _iter_named_modules(model: Any) -> Iterable[tuple[str, Any]]:
@@ -104,8 +128,9 @@ def iter_attention_modules(model: Any, state: Any | None = None):
             if _looks_like_attention(name, module):
                 debug(getattr(state, "debug", False), f"compatible attention candidate via {source_name}: {name or '<root>'} ({module.__class__.__name__})")
                 yield name or "<root>", module
-            elif getattr(state, "debug", False) and callable(getattr(module, "forward", None)) and (_has_attention_projections(module) or "att" in module.__class__.__name__.lower()):
-                candidates.append(f"{name or '<root>'} ({module.__class__.__name__})")
+            elif getattr(state, "debug", False) and callable(getattr(module, "forward", None)) and (_has_attention_projections(module) or _forward_mentions_attention(module) or "att" in module.__class__.__name__.lower()):
+                attrs = ",".join(a for a in ("qkv", "wo", "q_proj", "k_proj", "v_proj", "to_q", "to_k", "to_v", "wq", "wk", "wv", "out_proj") if hasattr(module, a))
+                candidates.append(f"{name or '<root>'} ({module.__class__.__name__}; attrs={attrs or '-'})")
     if candidates:
         debug(True, "unpatched attention-like candidates: " + "; ".join(candidates[:20]))
 
