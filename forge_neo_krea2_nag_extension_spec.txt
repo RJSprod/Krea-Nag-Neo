@@ -1,0 +1,731 @@
+TECHNICAL DEVELOPMENT SPEC
+Forge Neo extension: NAG support for Krea2 Turbo / Krea2 Raw
+Date: 2026-07-02
+Prepared for: coding agent implementation
+
+================================================================================
+0. Purpose
+================================================================================
+Build a Forge Neo WebUI extension that adds NAG, meaning Normalized Attention
+Guidance, for Krea2-family image generation.
+
+The extension must prioritize Krea2 Turbo because Krea2 Turbo is an 8-step
+distilled checkpoint whose official inference examples run with CFG disabled.
+That makes normal negative prompting weak or unavailable, and it is the exact
+few-step/distilled use case NAG was designed to address.
+
+This document intentionally scopes only the first three requested priorities.
+Treat all lower-bit/exotic paths and optimized-attention support as future work.
+
+================================================================================
+1. Confirmed source facts and reference links
+================================================================================
+Use these as the grounding references. Re-check current upstream files before
+coding because Forge Neo and Krea2 are moving quickly.
+
+1. Forge Neo target repo
+   - https://github.com/Haoming02/sd-webui-forge-classic/tree/neo
+   - The README describes Forge Neo as a continuation of latest Forge focused on
+     optimization/usability and running latest popular models via a GUI.
+   - The README also says most base Automatic1111 WebUI features should still
+     function.
+
+2. Krea2 official repo
+   - https://github.com/krea-ai/krea-2
+   - Krea2 ships as two models: Raw and Turbo.
+   - Raw is the undistilled base checkpoint; Krea recommends it for fine-tuning,
+     post-training, and LoRA training.
+   - Turbo is an 8-step distilled checkpoint for fast text-to-image inference.
+   - Krea recommends training LoRAs on Raw and applying them on Turbo.
+   - Official Raw command: steps 52, CFG 3.5.
+   - Official Turbo command: steps 8, CFG 0.0, mu 1.15.
+
+3. Krea2 Turbo model card
+   - https://huggingface.co/krea/Krea-2-Turbo
+   - Shows Krea2Pipeline / Diffusers usage:
+       num_inference_steps=8, guidance_scale=0.0
+   - Model overview: text-to-image diffusion transformer, 12B parameters.
+   - Release date listed as 2026-06-22.
+
+4. Krea2 Raw model card
+   - https://huggingface.co/krea/Krea-2-Raw
+   - Shows Raw usage:
+       num_inference_steps=52, guidance_scale=3.5
+   - Describes Raw as a base checkpoint and not the recommended primary inference
+     path compared with Turbo.
+
+5. Comfy-Org Krea2 repack
+   - https://huggingface.co/Comfy-Org/Krea-2
+   - Confirms ComfyUI repackaged Krea2 files and points to original Raw/Turbo
+     repositories.
+
+6. Krea2 reference implementation files
+   - https://raw.githubusercontent.com/krea-ai/krea-2/main/sampling.py
+   - https://raw.githubusercontent.com/krea-ai/krea-2/main/mmdit.py
+   - https://raw.githubusercontent.com/krea-ai/krea-2/main/inference.py
+   Important implementation details from the reference code:
+     - sampling.py skips negative/unconditional text encoding when CFG is disabled.
+     - sampling.py encodes negative_prompts only inside the cfg branch.
+     - mmdit.py defines a SingleStreamDiT with text+image tokens concatenated into
+       one sequence.
+     - mmdit.py has an Attention module that calls torch.nn.functional
+       scaled_dot_product_attention, then applies an output projection.
+     - inference.py defines Krea2 as SingleStreamDiT with Qwen3VLConditioner.
+
+7. NAG official project and paper
+   - https://github.com/ChenDarYen/Normalized-Attention-Guidance
+   - https://chendaryen.github.io/NAG.github.io/
+   - https://arxiv.org/abs/2505.21179
+   NAG is described as a training-free method that applies negative guidance in
+   attention space. It extrapolates positive and negative attention features,
+   applies L1-based normalization, then alpha-blends the guided feature with the
+   original positive feature.
+
+8. NAG official code of interest
+   - https://github.com/ChenDarYen/Normalized-Attention-Guidance/tree/main/nag
+   - Important files:
+       nag/attention_joint_nag.py
+       nag/attention_flux_nag.py
+       nag/attention_wan_nag.py
+       nag/normalization.py
+       nag/pipeline_flux_nag.py
+       nag/pipeline_wan_nag.py
+   - The implementation is MIT licensed. If copying or adapting code, preserve
+     license headers/attribution as required.
+
+9. ComfyUI-NAG
+   - https://github.com/ChenDarYen/ComfyUI-NAG
+   - Provides practical NAG UI concepts and parameter names.
+   - Supports KSamplerWithNAG, NAGGuider, NAGCFGGuider style workflows.
+   - Current supported families include Flux, Flux Kontext, Wan, Vace Wan,
+     Hunyuan Video, Chroma, SD3.5, SDXL, and SD. Krea2 is not listed at the time
+     this document was written.
+
+10. Existing Forge Neo extension patterns
+   - https://github.com/captainzero93/sd-webui-forge-classic-neo-extensions
+   - Existing ports include FreeU, Perturbed Attention, and SAG for Forge Neo.
+   - Use these to learn extension folder structure and how attention/sampler
+     guidance extensions hook into Forge Neo.
+
+================================================================================
+2. Requested support scope
+================================================================================
+Required priorities:
+
+P0. Foundation / base MVP
+    - Extension installs and loads in Forge Neo.
+    - UI appears in txt2img for Krea2-family models.
+    - No-op behavior is stable when disabled or when the active model is not Krea2.
+
+P1. Krea2 Turbo bf16
+    - Must work with official Turbo-style settings:
+        steps: 8
+        CFG/guidance: 0.0 or disabled
+        mu: 1.15 when the UI exposes mu
+        resolution: 1024 to 2048, starting with 1024
+    - This is the main target.
+
+P2. Krea2 Turbo fp8_scaled
+    - Must work with Forge Neo's fp8_scaled Krea2 Turbo loading path.
+    - NAG math should operate on attention activations in a safe dtype, preferably
+      float32 for norms and then cast back to the model activation dtype.
+    - Do not require nvfp4, mxfp8, int8, convrot int8, or GGUF in this milestone.
+
+P3. Krea2 Raw bf16 + LoRA compatibility
+    - Raw bf16 support should not regress Turbo.
+    - LoRA compatibility means: when Forge Neo has already applied/loaded a Krea2
+      LoRA, enabling NAG must not strip or bypass the LoRA-modified weights.
+    - Required LoRA path: Raw-trained LoRAs used on Turbo inference, matching Krea's
+      recommendation. Also verify Raw bf16 with LoRA does not crash.
+
+Explicit non-goals for this spec:
+    - Krea2 Turbo nvfp4, mxfp8, int8, convrot int8.
+    - Wan, Flux, SDXL, SD3, Qwen-Image, Anima, Z-Image, Ernie-Image.
+    - Optimized-attention compatibility as a release requirement: SageAttention,
+      FlashAttention, Spectrum, TeaCache, WaveSpeed, torch.compile full-model.
+    - img2img, inpaint, ControlNet, refiner/high-low routing.
+    - Perfect speed parity with normal Turbo sampling.
+
+================================================================================
+3. Product behavior
+================================================================================
+Add a Krea2 NAG section to the txt2img UI.
+
+Recommended UI fields:
+
+- Enable Krea2 NAG: checkbox, default false.
+- NAG negative prompt: multiline textbox.
+  Default: empty.
+  Placeholder examples: "text, watermark, blurry, low quality, deformed hands".
+- nag_scale: slider.
+  Default: 5.0 for Turbo.
+  Suggested range: 1.0 to 15.0, step 0.1.
+  1.0 should effectively be no guidance.
+- nag_tau: slider.
+  Default: 2.5.
+  Suggested range: 0.1 to 5.0, step 0.05.
+- nag_alpha: slider.
+  Default: 0.125 or 0.25.
+  Suggested range: 0.0 to 1.0, step 0.01.
+- nag_sigma_end / nag_timestep_end: slider.
+  Because Krea2 uses flow-matching timesteps t from 1 -> 0, expose this as
+  "Apply NAG until t <=" or internally convert to the closest available Forge
+  sampler sigma/timestep convention.
+  Practical default for Turbo: active for all 8 steps until tuning proves a
+  faster cutoff works.
+- Compatibility mode: dropdown.
+  Values:
+    auto
+    krea2_turbo
+    krea2_raw
+    force_disable
+- Debug logging: checkbox, default false.
+
+Infotext metadata must include:
+    Krea2 NAG: enabled/disabled
+    NAG negative prompt
+    nag_scale
+    nag_tau
+    nag_alpha
+    nag_sigma_end or equivalent timestep cutoff
+    Krea2 NAG mode detected: turbo/raw/unknown
+    Krea2 NAG adapter version
+
+================================================================================
+4. High-level architecture
+================================================================================
+Do NOT implement this as normal CFG. The extension must apply NAG inside the
+attention path.
+
+Preferred architecture:
+
+sd_forge_krea2_nag/
+  install.py                         optional; keep dependencies minimal
+  scripts/
+    krea2_nag.py                     WebUI Script class + UI + process hooks
+  krea2_nag/
+    __init__.py
+    state.py                         request-local NAG state
+    detect.py                        active model detection
+    conditioning.py                  negative prompt encoding helpers
+    patcher.py                       patch/restore attention modules
+    attention.py                     Krea2 attention wrapper + NAG math
+    logging.py                       debug logs
+    version.py
+  README.md
+  LICENSE                            include MIT attribution if code is adapted
+
+Preferred Forge hook sequence:
+
+1. In Script.ui(), render the UI controls.
+2. In process_before_every_sampling or the closest Forge Neo callback:
+   - Return immediately if disabled.
+   - Detect active model family.
+   - Return or warn if not Krea2.
+   - Encode the NAG negative prompt with the same Krea2/Qwen3-VL text encoder path
+     used by the current model.
+   - Install Krea2 attention wrappers on the active model.
+   - Store request-local state; do not use persistent global state without cleanup.
+3. During model forward:
+   - Duplicate the image/latent branch for positive and NAG-negative conditioning.
+   - Run attention with both positive and NAG-negative text context available.
+   - Apply NAG feature extrapolation/normalization/blending to the positive image
+     token features.
+   - Return only the guided positive velocity/prediction to the sampler, plus
+     normal uncond branch if CFG is active.
+4. After sampling, restore all patched functions/modules in a finally block.
+
+Important: patch after Forge Neo has loaded the model and after LoRA patches have
+been applied. Restore the exact original functions on completion or error.
+
+================================================================================
+5. Krea2 model-detection requirements
+================================================================================
+Implement robust detection. Do not rely on one filename rule only.
+
+Detection checks, in order:
+
+1. Active model object/class/module names contain any of:
+   - Krea
+   - Krea2
+   - SingleStreamDiT
+   - SingleMMDiT
+   - Qwen3VLConditioner
+
+2. Model metadata or checkpoint filename contains any of:
+   - krea-2
+   - krea2
+   - krea_2
+   - Krea-2-Turbo
+   - Krea-2-Raw
+   - turbo.safetensors
+   - raw.safetensors
+
+3. Architecture shape check, if model internals are visible:
+   - blocks / transformer blocks exist
+   - each block has an attention module compatible with q/k/v projections
+   - combined text+image token sequence is used
+
+4. Mode detection:
+   - Turbo if checkpoint/model path contains "turbo" or official Turbo HF repo ID.
+   - Raw if checkpoint/model path contains "raw" or official Raw HF repo ID.
+   - Unknown Krea2: allow with warning only in auto mode; otherwise require manual
+     compatibility mode selection.
+
+If detection fails, the extension must be a no-op and must not affect generation.
+
+================================================================================
+6. Core NAG math
+================================================================================
+Use the official NAG implementation as the source of truth, especially
+attention_joint_nag.py.
+
+The essential math, expressed for matching positive and negative attention
+features, is:
+
+    z_guided = z_positive * nag_scale - z_negative * (nag_scale - 1)
+
+    norm_positive = L1Norm(z_positive, dim=-1, keepdim=True)
+    norm_guided   = L1Norm(z_guided,   dim=-1, keepdim=True)
+
+    ratio = norm_guided / (norm_positive + eps)
+
+    z_normalized = z_guided * min(ratio, nag_tau) / (ratio + eps)
+
+    z_out = z_normalized * nag_alpha + z_positive * (1 - nag_alpha)
+
+Implementation details:
+
+- Compute L1 norms in float32 for fp8_scaled/bf16 stability.
+- Cast z_out back to the original attention activation dtype.
+- Apply only when nag_scale > 1.0 and a non-empty NAG negative conditioning exists.
+- Start by applying guidance to image-token attention features only. For Krea2's
+  single-stream text+image sequence, text-token sequence lengths may differ between
+  positive and negative prompts, but image-token length is stable.
+- Leave text-token outputs unchanged unless experiments prove guiding text tokens is
+  necessary and stable.
+- Add eps = 1e-7 or similar.
+
+================================================================================
+7. Krea2-specific implementation strategy
+================================================================================
+Krea2 is a SingleStreamDiT / MMDiT-style model. The reference code concatenates
+text context tokens and image tokens into a single sequence before transformer
+blocks. Therefore, the extension must be Krea2-family specific.
+
+Do not assume a cross-attention module like SDXL UNet. The target is the
+single-stream self-attention over combined text+image tokens.
+
+Reference Krea2 attention path from official mmdit.py:
+
+- Attention.forward(qkv, freqs, mask)
+- q/k/v/gate are projected from qkv.
+- q/k/v are reshaped into heads.
+- q/k are normalized.
+- RoPE is applied when freqs is provided.
+- scaled_dot_product_attention is called.
+- attention output is rearranged back to sequence features.
+- output is multiplied by sigmoid(gate).
+- output projection wo is applied.
+
+Recommended patch point:
+
+Patch the Krea2 Attention.forward method or equivalent Forge Neo Krea2 attention
+module. The wrapper should reproduce the original code path, but before output
+projection it should apply NAG to the positive image-token feature slice using the
+corresponding negative image-token feature slice.
+
+Do not monkeypatch torch.nn.functional.scaled_dot_product_attention globally.
+Patch only the Krea2 model instance's attention modules.
+
+Pseudo-flow for Turbo CFG-disabled case:
+
+    positive_context, positive_txt_mask = existing conditioning for prompt
+    nag_context, nag_txt_mask = encode(nag_negative_prompt)
+    img_tokens = current latent image tokens
+
+    Build a 2-branch Krea2 forward:
+        branch 0: positive_context + img_tokens
+        branch 1: nag_context      + img_tokens
+
+    For each Krea2 block's attention output:
+        z_positive_img = attention_output[branch 0, image_token_slice, :]
+        z_negative_img = attention_output[branch 1, image_token_slice, :]
+        z_guided_img = nag(z_positive_img, z_negative_img)
+        replace branch 0 image-token output with z_guided_img
+
+    Continue block computation.
+    At model output:
+        return only branch 0's final image-token velocity/prediction.
+
+Pseudo-flow for Raw + CFG case:
+
+    Branches may be:
+        branch 0: uncond / normal negative prompt for CFG
+        branch 1: positive prompt
+        branch 2: NAG negative prompt
+
+    Apply NAG to branch 1 using branch 2.
+    Leave branch 0 unchanged.
+    Return branch 0 and guided branch 1 to Forge's existing CFG composition.
+
+If Forge Neo uses a different ordering for cond/uncond branches, detect and adapt
+rather than assuming this branch order. Add debug logs showing branch count and
+mode.
+
+================================================================================
+8. Conditioning and text-encoder requirements
+================================================================================
+The NAG negative prompt must be encoded with the same Krea2 text encoder path as
+normal prompts.
+
+Krea2 uses Qwen3-VL conditioning in the official code. In Forge Neo, find the
+existing Krea2 text-encoding wrapper and call that, rather than importing a second
+copy of Qwen3VLConditioner.
+
+Requirements:
+
+- Do not instantiate a duplicate Qwen3-VL text encoder unless no Forge pathway is
+  available. Reusing the active model pipeline is required for memory efficiency.
+- Cache NAG negative conditioning per prompt/batch/seed request, not globally.
+- Batch behavior:
+    - For batch size N, encode N NAG-negative prompts.
+    - If the UI field is one prompt, repeat it N times.
+    - If prompt matrix/batch prompt behavior is available, initially repeat the
+      same NAG negative prompt for all items.
+- Text length mismatch handling:
+    - If Krea2/Forge produces fixed-length text embeddings, use them directly.
+    - If positive and NAG negative contexts differ in token length, pad both to
+      the same text length and update masks correctly.
+    - Image-token slices must be calculated from the actual text length after
+      padding.
+- Empty NAG negative prompt:
+    - Either no-op or use an empty-string encoded negative prompt based on a UI
+      setting.
+    - Default should be no-op for empty field to avoid surprising users.
+
+================================================================================
+9. Dtype and quantization requirements
+================================================================================
+P1 bf16:
+    - Model weights/activations usually bf16.
+    - NAG norm calculations should use float32 internally, then cast to bf16.
+
+P2 fp8_scaled:
+    - Treat fp8_scaled as a model weight/loading format. Attention activations may
+      be bf16/fp16/float32 depending on Forge Neo internals.
+    - Do not assume activations are actually torch.float8 tensors.
+    - If an activation tensor is fp8 or unsupported for torch.norm, upcast to
+      float32 for NAG math and cast back to the original dtype after blending.
+    - Validate no dtype mismatch around output projection.
+
+P3 LoRA:
+    - Apply NAG wrappers to the active model object after LoRA has modified or
+      injected layers.
+    - Do not clone a pristine model that loses LoRA patches.
+    - If Forge applies LoRA dynamically per request, install NAG after LoRA
+      application or wrap the post-LoRA attention modules.
+    - Test with at least one official Krea LoRA if available locally.
+
+================================================================================
+10. Extension lifecycle and cleanup
+================================================================================
+The extension must be safe to enable/disable without restarting Forge Neo.
+
+Required lifecycle behavior:
+
+- Store original attention forward callables in a patch registry.
+- Patch only once per module per request.
+- Use try/finally cleanup around generation.
+- Restore original callables after generation completes or errors.
+- Clear request-local NAG state after generation.
+- Do not leave model_options, sampler hooks, or global state mutated.
+- If another attention-guidance extension is active, warn and skip unless explicit
+  override is enabled.
+
+Potential known collision area:
+- Forge Neo users have reported conflicts between PAG/SAG-style extensions and
+  integrated features such as Spectrum. Because NAG is also an attention-level
+  modification, prioritize clean restoration and incompatibility warnings.
+
+================================================================================
+11. Compatibility behavior
+================================================================================
+Default compatibility policy:
+
+- Non-Krea2 model: silently no-op or show one warning in debug mode.
+- Krea2 Turbo bf16: supported.
+- Krea2 Turbo fp8_scaled: supported after P2.
+- Krea2 Raw bf16: supported after P3.
+- Krea2 + LoRA: supported after P3.
+- Krea2 + nvfp4/mxfp8/int8/convrot/GGUF: show unsupported warning and no-op.
+- Krea2 + SageAttention/FlashAttention/Spectrum/TeaCache/WaveSpeed/torch.compile:
+  show experimental warning. Do not claim support unless explicitly tested.
+- CFG disabled: required for Turbo.
+- CFG enabled: required for Raw if Forge's Krea Raw path uses CFG; implement branch
+  handling as described above.
+
+================================================================================
+12. Development task breakdown
+================================================================================
+Task 1: Repository skeleton
+- Create sd_forge_krea2_nag extension folder.
+- Add scripts/krea2_nag.py with a minimal Script class and UI controls.
+- Add README with install instructions.
+- Add version constant.
+
+Task 2: Active model detection
+- Implement detect.py.
+- Log model class, checkpoint name/path, dtype/quantization mode when debug is on.
+- Return Krea2 mode: turbo, raw, unknown.
+
+Task 3: NAG state object
+- Implement a request-local state dataclass:
+    enabled: bool
+    mode: str
+    nag_negative_prompt: list[str]
+    nag_scale: float
+    nag_tau: float
+    nag_alpha: float
+    nag_sigma_end or nag_timestep_end: float | None
+    current_step/timestep/sigma: optional
+    positive_batch_size: int
+    branch_layout: enum
+    text_lengths/image_token_slices: runtime info
+    debug: bool
+
+Task 4: Negative conditioning
+- Locate Forge Neo's Krea2 prompt encoding code.
+- Implement encode_nag_negative(prompt_batch, p, model) that returns context and
+  masks compatible with the active Krea2 model.
+- Avoid duplicate text encoder instances.
+
+Task 5: Krea2 attention wrapper
+- Implement patcher.py to find Krea2 Attention modules.
+- Implement attention.py wrapper around the module's original forward.
+- Reproduce original attention forward behavior exactly, except for the NAG feature
+  replacement step.
+- Support at least the official Krea2-style q/k/v/gate/wo fields.
+- If Forge Neo uses a different attention class, write an adapter with feature
+  detection rather than hard-coding one path.
+
+Task 6: Turbo bf16 end-to-end
+- Implement branch duplication for CFG-disabled Turbo.
+- Return guided positive output only.
+- Validate 1024x1024, batch size 1, steps 8, CFG 0.
+
+Task 7: Turbo fp8_scaled
+- Validate dtype conversions.
+- Fix any fp8/fp16/bf16 norm or projection problems.
+- Ensure the extension does not force the whole model to bf16 if Forge loaded it
+  in fp8_scaled mode.
+
+Task 8: Raw bf16
+- Support Raw with official-style settings: steps 52, CFG 3.5.
+- If CFG branch layout is complex in Forge, implement Raw NAG-only first with a
+  warning, then implement Raw + CFG branch handling before marking P3 complete.
+
+Task 9: LoRA compatibility
+- Ensure NAG wrapping happens after LoRA injection/application.
+- Verify LoRA effect remains visible with NAG off and on.
+- Test Turbo with a Raw-trained Krea LoRA, per Krea's recommended workflow.
+
+Task 10: Metadata and cleanup
+- Add infotext metadata.
+- Add final restoration and exception cleanup.
+- Add debug logs.
+
+================================================================================
+13. Acceptance tests
+================================================================================
+Use fixed seeds and compare NAG off vs on. Keep test images private/local.
+
+Test A: no-op disabled
+- Model: Krea2 Turbo bf16
+- Prompt: "a red fox sitting in fresh snow, golden hour"
+- NAG disabled
+- Expected: generation succeeds, output path unchanged, no patch state remains.
+
+Test B: no-op empty negative prompt
+- Model: Krea2 Turbo bf16
+- NAG enabled but NAG negative prompt empty
+- Expected: no crash; either no-op or explicit empty-prompt mode based on setting.
+
+Test C: Turbo bf16 negative guidance
+- Model: Krea2 Turbo bf16
+- Settings: 8 steps, CFG 0.0, mu 1.15, 1024x1024
+- Prompt: "a clean product photo of a ceramic mug on a table, studio lighting"
+- NAG negative prompt: "text, watermark, logo, blurry, low quality"
+- Expected: output succeeds; metadata includes NAG settings; visible reduction of
+  unwanted text/watermark artifacts compared with NAG off where applicable.
+
+Test D: Turbo fp8_scaled
+- Same as Test C, using Turbo fp8_scaled.
+- Expected: no dtype errors; output succeeds; no large VRAM leak after generation.
+
+Test E: Raw bf16 NAG-only
+- Model: Krea2 Raw bf16
+- Settings: 52 steps, CFG 0.0 initially if required by implementation simplicity
+- NAG negative prompt: "blurry, low detail, text, watermark"
+- Expected: output succeeds.
+
+Test F: Raw bf16 + CFG
+- Model: Krea2 Raw bf16
+- Settings: 52 steps, CFG 3.5
+- NAG negative prompt: "blurry, text, watermark"
+- Expected: output succeeds and branch handling remains correct.
+
+Test G: Turbo + LoRA
+- Model: Krea2 Turbo bf16 or fp8_scaled
+- Load an official or known-good Krea2 LoRA trained on Raw.
+- Prompt should clearly trigger the LoRA style.
+- NAG negative prompt: "text, watermark, blurry"
+- Expected: LoRA style remains active; NAG does not strip LoRA behavior; no crash.
+
+Test H: cleanup after failure
+- Force an error while NAG is enabled, then run a normal generation with NAG off.
+- Expected: normal generation works without restart; original attention functions
+  were restored.
+
+Test I: non-Krea model no-op
+- Load any non-Krea model.
+- Enable NAG.
+- Expected: no crash; no-op with optional warning.
+
+================================================================================
+14. Tuning defaults
+================================================================================
+Start with these defaults; tune empirically.
+
+For Krea2 Turbo:
+    nag_scale = 5.0
+    nag_tau   = 2.5
+    nag_alpha = 0.125 or 0.25
+    apply across all 8 steps initially
+
+For Krea2 Raw:
+    nag_scale = 3.0 to 5.0
+    nag_tau   = 1.5 to 2.5
+    nag_alpha = 0.10 to 0.25
+    If CFG is also active, start lower than Turbo to avoid overguidance.
+
+Expected UI guidance:
+    - Increase nag_scale for stronger suppression.
+    - Increase nag_tau or nag_alpha carefully; too high can create artifacts.
+    - For few-step Turbo, stronger tau/alpha is usually more tolerable than for
+      many-step Raw.
+
+================================================================================
+15. Common pitfalls
+================================================================================
+1. Accidentally implementing CFG instead of NAG.
+   - Do not return cond + scale * (cond - neg) at the model-output level and call it
+     done. NAG must operate inside attention features.
+
+2. Text length mismatch.
+   - Krea2 positive and NAG negative prompts may encode to different lengths.
+   - Guide the image-token slice because image-token length is stable.
+   - Pad text contexts/masks if batching positive and negative contexts together.
+
+3. Broken cleanup.
+   - If the user must restart Forge Neo after one NAG run, cleanup is insufficient.
+
+4. Breaking LoRA.
+   - Patching must wrap post-LoRA modules, not replace them with pristine modules.
+
+5. Optimized attention assumptions.
+   - Sage/Flash/Spectrum may alter attention shapes or kernels.
+   - Out of scope until explicitly tested.
+
+6. Batch layout confusion.
+   - Forge samplers may already batch cond/uncond branches.
+   - Add debug logging for branch count and tensor shapes.
+   - Fail closed instead of silently generating corrupted results.
+
+7. Applying NAG after output projection only.
+   - NAG should be applied to attention features before or at the attention-output
+     feature stage. Applying to final denoiser output is not the intended method.
+
+================================================================================
+16. Suggested coding-agent investigation commands
+================================================================================
+Run these in the local Forge Neo checkout before implementation:
+
+    git branch --show-current
+    git rev-parse HEAD
+    grep -R "Krea" -n backend modules modules_forge | head -100
+    grep -R "SingleStreamDiT\|SingleMMDiT\|Qwen3VL\|qwen3vl" -n . | head -100
+    grep -R "scaled_dot_product_attention" -n backend modules modules_forge | head -100
+    grep -R "process_before_every_sampling\|set_model_sampler" -n extensions modules backend | head -100
+    grep -R "forge_objects\|ModelPatcher\|model_options" -n backend modules modules_forge | head -100
+
+Then inspect existing Neo attention-guidance extensions:
+
+    extensions/sd_forge_perturbed_attention_neo/scripts/*.py
+    extensions/sd_forge_sag_neo/scripts/*.py
+
+================================================================================
+17. Minimal implementation sketch
+================================================================================
+This sketch is intentionally incomplete because the exact Forge Neo Krea2 wrapper
+must be inspected locally.
+
+class Krea2NagScript(scripts.Script):
+    def title(self):
+        return "Krea2 NAG"
+
+    def ui(self, is_img2img):
+        # render checkbox/textbox/sliders
+        return [enabled, nag_negative_prompt, nag_scale, nag_tau, nag_alpha, nag_cutoff, mode, debug]
+
+    def process_before_every_sampling(self, p, *args):
+        if not enabled:
+            return
+        model = p.sd_model
+        info = detect_krea2(model, p)
+        if not info.is_krea2:
+            return
+        nag_cond = encode_krea2_nag_negative(p, model, nag_negative_prompt)
+        state = Krea2NagState(...)
+        install_krea2_attention_patches(model, state)
+        p.extra_generation_params.update({...})
+
+    def postprocess(self, p, processed, *args):
+        restore_krea2_attention_patches(p.sd_model)
+
+Use a try/finally pattern where Forge callbacks permit it. If postprocess is not
+guaranteed after failure, register an additional cleanup callback or wrap the
+sampler launch path the way existing Forge Neo extensions do.
+
+================================================================================
+18. Definition of done
+================================================================================
+The extension is complete for this scope when:
+
+- It installs by copying the folder into Forge Neo's extensions directory and
+  restarting Forge Neo.
+- It displays a Krea2 NAG UI section.
+- It no-ops safely on non-Krea2 models.
+- It supports Krea2 Turbo bf16 with CFG disabled at 8 steps.
+- It supports Krea2 Turbo fp8_scaled without dtype errors.
+- It supports Krea2 Raw bf16.
+- It supports Krea2 LoRA compatibility without stripping LoRA behavior.
+- It writes reproducible infotext metadata.
+- It restores all patches after generation and after errors.
+- It has debug logs sufficient to diagnose branch layout, dtype, text/image token
+  slices, and whether NAG was applied.
+- It includes README warnings about unsupported low-bit modes and optimized
+  attention paths.
+
+================================================================================
+19. README warnings to include
+================================================================================
+Suggested wording:
+
+"This extension implements Krea2-family Normalized Attention Guidance for Forge
+Neo. Initial support targets Krea2 Turbo bf16, Krea2 Turbo fp8_scaled, Krea2 Raw
+bf16, and Krea2 LoRA workflows. nvfp4, mxfp8, int8, GGUF, SageAttention,
+FlashAttention, Spectrum, TeaCache, WaveSpeed, and full torch.compile paths are
+experimental or unsupported until tested. Disable other attention-guidance
+extensions when using Krea2 NAG."
+
